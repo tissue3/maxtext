@@ -440,6 +440,7 @@ class CheckpointManager:
     # The step of the save most recently handed to Orbax, so a failure that surfaces later can
     # be attributed to it.
     self._in_flight_step: int | None = None
+    self._in_flight_has_optimizer: bool = False
     # The failure dropped by the most recent abandonment, if no later save has replaced it in
     # Orbax; the one failure a wait with no save in flight may drop again (see `_drain_in_flight_save`).
     self._abandoned_failure: BaseException | None = None
@@ -493,6 +494,33 @@ class CheckpointManager:
     """Waits for any ongoing async checkpoint save; a failed one is raised or abandoned (see `_drain_in_flight_save`)."""
     self._drain_in_flight_save("explicit wait")
 
+  def wait_before_donation(self) -> None:
+    """Under colocated_python async, blocks until the in-flight save no longer reads the live train state.
+
+    `update()` donates the whole train state. `model_params` is staged to a private pinned_host copy
+    at save time, so a weights-only save (`save_optimizer_state=False`) needs no wait here. When
+    `optimizer_state` is saved, it is handed to Orbax live (with `optimizer_memory_host_offload` it
+    already sits on pinned_host and a private copy would double the host-resident optimizer), so a
+    save still running when the next `update()` arrives is waited for here; otherwise the donation
+    frees buffers Orbax is still serializing ("Array has been deleted"). No-op when nothing with
+    `optimizer_state` is in flight or for other checkpointing impls (Pathways persistence takes its
+    own references).
+    """
+    if (
+        self._in_flight_step is None
+        or not self._in_flight_has_optimizer
+        or not (_REGISTERED_IMPL == _COLOCATED_PYTHON and self._async_checkpointing)
+    ):
+      return
+    step = self._in_flight_step
+    start = time.perf_counter()
+    self._drain_in_flight_save("before update() donates the train state")
+    logging.info(
+        "update() waited %.2fs for the async checkpoint save at step %s to finish reading the train state.",
+        time.perf_counter() - start,
+        step,
+    )
+
   def _drain_in_flight_save(self, reason: str) -> bool:
     """Blocks until the save most recently handed to Orbax has finished, attributing its failure to its step.
 
@@ -532,6 +560,7 @@ class CheckpointManager:
       self._checkpoint_manager.wait_until_finished()
     except Exception as e:  # pylint: disable=broad-except
       self._in_flight_step = None
+      self._in_flight_has_optimizer = False
       if step is None:
         if e is self._abandoned_failure:
           logging.warning(
@@ -571,6 +600,7 @@ class CheckpointManager:
       )
       return False
     self._in_flight_step = None
+    self._in_flight_has_optimizer = False
     return True
 
   def get_saved_micro_step_count(self, step: int) -> int:
@@ -787,6 +817,7 @@ class CheckpointManager:
     )
     if saved:
       self._in_flight_step = step
+      self._in_flight_has_optimizer = "optimizer_state" in save_args
       self._abandoned_failure = None  # Orbax's finalize thread is replaced; the old failure cannot surface again.
     if saved and not fingerprints_enabled:
       logging.info("Checkpoint step=%d saved without fingerprints (ENABLE_ORBAX_FINGERPRINT=0).", step)

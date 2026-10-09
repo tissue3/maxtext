@@ -219,6 +219,75 @@ class TrainingEngineSavePlacementTest(unittest.TestCase):
         self.assertEqual(getattr(leaf.sharding, "memory_kind", None), "device")
     self.assertGreaterEqual(live_device_leaves, staged_array_leaves)
 
+  def test_wait_before_donation_drains_only_in_flight_colocated_async_save(self):
+    engine, _ = _create_engine(self.ckpt_dir)
+    mgr = engine._checkpoint_manager
+    mock_inner_mgr = mock.MagicMock()
+    mock_inner_mgr.save.return_value = True
+    mock_inner_mgr.should_save.return_value = False
+    mgr._checkpoint_manager = mock_inner_mgr
+    mgr._async_checkpointing = True
+
+    # Full save (with optimizer_state) in flight + colocated_python + async -> drained once, markers cleared.
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._COLOCATED_PYTHON):
+      engine.save_checkpoint(metadata={"step": 3}, save_optimizer_state=True)
+      self.assertEqual(mgr._in_flight_step, 3)
+      self.assertTrue(mgr._in_flight_has_optimizer)
+      mgr.wait_before_donation()
+    mock_inner_mgr.wait_until_finished.assert_called_once()
+    self.assertIsNone(mgr._in_flight_step)
+    self.assertFalse(mgr._in_flight_has_optimizer)
+
+    # Weights-only save (save_optimizer_state=False) -> model_params is already staged, so update() must NOT
+    # wait, while _in_flight_step stays set for the next save_checkpoint() to drain.
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._COLOCATED_PYTHON):
+      engine.save_checkpoint(metadata={"step": 4}, save_optimizer_state=False)
+      self.assertEqual(mgr._in_flight_step, 4)
+      self.assertFalse(mgr._in_flight_has_optimizer)
+      mgr.wait_before_donation()
+    mock_inner_mgr.wait_until_finished.assert_called_once()
+    self.assertEqual(mgr._in_flight_step, 4)
+
+    # Nothing in flight -> no wait.
+    mgr._in_flight_step = None
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._COLOCATED_PYTHON):
+      mgr.wait_before_donation()
+    mock_inner_mgr.wait_until_finished.assert_called_once()
+
+    # Persistence keeps its own references: a save in flight must NOT serialize the next update.
+    mgr._in_flight_step = 4
+    mgr._in_flight_has_optimizer = True
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._PERSISTENCE):
+      mgr.wait_before_donation()
+    mock_inner_mgr.wait_until_finished.assert_called_once()
+    self.assertEqual(mgr._in_flight_step, 4)
+
+    # Sync colocated saves already returned after writing: no wait either.
+    mgr._async_checkpointing = False
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._COLOCATED_PYTHON):
+      mgr.wait_before_donation()
+    mock_inner_mgr.wait_until_finished.assert_called_once()
+
+    # A failed background save surfaces from here with the usual attribution (not abandoned by default).
+    mgr._async_checkpointing = True
+    mgr._in_flight_step = 5
+    mgr._in_flight_has_optimizer = True
+    mock_inner_mgr.wait_until_finished.side_effect = RuntimeError("Array has been deleted")
+    with mock.patch.object(checkpointing, "_REGISTERED_IMPL", checkpointing._COLOCATED_PYTHON):
+      with self.assertRaisesRegex(RuntimeError, "Array has been deleted"):
+        mgr.wait_before_donation()
+    self.assertIsNone(mgr._in_flight_step)
+    self.assertFalse(mgr._in_flight_has_optimizer)
+
+  def test_update_waits_before_the_donating_compiled_update(self):
+    # Structural: the guard must sit between the early return and the donating call in update().
+    import inspect  # pylint: disable=g-import-not-at-top
+
+    src = inspect.getsource(MaxTextTrainingEngine.update)
+    self.assertIn("self._checkpoint_manager.wait_before_donation()", src)
+    self.assertLess(src.index("wait_before_donation()"), src.index("self._compiled_update("))
+    self.assertLess(src.index("return self.train_step"), src.index("wait_before_donation()"))
+
   def test_colocated_python_sync_or_other_impl_does_not_stage_to_pinned_host(self):
     engine, mesh = _create_engine(self.ckpt_dir)
     saved_items = {}
